@@ -537,19 +537,25 @@ function showDiagnosticModal() {
 }
 
 // ════════════════════════════════════════════════
-// REAL TRANSACTION — OP_WALLET
+// DEPOSIT FLOW
 //
-// Method yang tersedia di window.opnet (confirmed dari diagnostik):
-//   requestAccounts, getAccounts, getBalance, getNetwork, getChain
-//   getPublicKey, getMLDSAPublicKey, getVersion
-//   signMessage, signData, signInteraction
-//   signAndBroadcastInteraction  ← METHOD UTAMA untuk contract call
-//   deployContract, cancelTransaction
-//   switchChain, switchNetwork, disconnect
-//   pushTx, getBitcoinUtxos
-//   on, off, once, emit, broadcast
-//   verifyMLDSASignature, verifyMessageOfBIP322Simple, signMLDSAMessage
+// signAndBroadcastInteraction butuh P2OP contract address format
+// khusus dari @btc-vision/transaction library — tidak bisa dipakai
+// dari plain HTML. Solusi: sign intent + buka protokol asli.
+//
+// Pool URL mapping:
+//   btc-stake   → farm.motoswap.org/menu  (BTC staking MotoChef)
+//   moto-lp     → motoswap.org            (swap/LP)
+//   moto-pill-lp→ motoswap.org            (swap/LP)
+//   moto-stake  → farm.motoswap.org/menu  (MOTO staking)
 // ════════════════════════════════════════════════
+
+const POOL_URLS = {
+  'btc-stake':    'https://farm.motoswap.org/menu',
+  'moto-lp':      'https://motoswap.org',
+  'moto-pill-lp': 'https://motoswap.org',
+  'moto-stake':   'https://farm.motoswap.org/menu',
+};
 
 async function executeDeposit(pool, amountBTC) {
   if (!S.w?.p) throw new Error('Wallet tidak terhubung');
@@ -565,122 +571,39 @@ async function executeDeposit(pool, amountBTC) {
 
   const prov = S.w.p;
 
-  // ── Contract addresses pool ──
-  const ADDR_MAP = {
-    'btc-stake':    'tb1p24gquaqyrgszwwu5xt7vewczzdftm7lzpzgmj56vqxm9d0hgnk3spzm7x5',
-    'moto-lp':      'tb1p2rdsm82ry9zmf8uxd8cdrw7s42zrxl7ty97m09rxuuhyq5k66wusj7u9rl',
-    'moto-pill-lp': 'tb1p2rdsm82ry9zmf8uxd8cdrw7s42zrxl7ty97m09rxuuhyq5k66wusj7u9rl',
-    'moto-stake':   'tb1p2rdsm82ry9zmf8uxd8cdrw7s42zrxl7ty97m09rxuuhyq5k66wusj7u9rl',
-  };
-  const toAddr = ADDR_MAP[pool.id] || ADDR_MAP['btc-stake'];
+  // ── Step 1: Sign intent message sebagai bukti ──
+  // Ini membuktikan kamu punya wallet dan setuju dengan deposit ini
+  const intent = [
+    '=== OpNet Yield Aggregator Intent ===',
+    `Pool: ${pool.name}`,
+    `Protocol: ${pool.protocol}`,
+    `Amount: ${amountBTC} tBTC (${sats} sats)`,
+    `APY: ${pool.apy}%`,
+    `Wallet: ${S.w.address}`,
+    `Network: testnet`,
+    `Timestamp: ${Date.now()}`,
+    '=====================================',
+  ].join('\n');
 
-  // ══════════════════════════════════════════════
-  // METHOD UTAMA: signAndBroadcastInteraction
-  // Format InteractionParameters (dari @btc-vision/transaction):
-  // {
-  //   signer: string,        ← alamat wallet
-  //   to: string,            ← contract address
-  //   calldata: Uint8Array,  ← encoded function call (bisa kosong)
-  //   value: bigint,         ← satoshi sebagai BigInt
-  //   feeRate: number,       ← sat/vbyte
-  //   network: 'testnet'|'mainnet'|'regtest'
-  // }
-  // ══════════════════════════════════════════════
-  if (typeof prov.signAndBroadcastInteraction === 'function') {
-    try {
-      // calldata: deposit() selector = 0xd0e30db0
-      // Encode sebagai Uint8Array
-      const selector = new Uint8Array([0xd0, 0xe3, 0x0d, 0xb0]);
-
-      const params = {
-        signer:   S.w.address,
-        to:       toAddr,
-        calldata: selector,
-        value:    BigInt(sats),
-        feeRate:  5,
-        network:  'testnet',
-      };
-
-      const result = await prov.signAndBroadcastInteraction(params);
-
-      // result bisa berupa string txid, atau object {txid, ...}
-      const txid = typeof result === 'string'
-        ? result
-        : (result?.txid || result?.tx_hash || result?.hash || result?.transactionId
-           || result?.id || JSON.stringify(result).slice(0, 64));
-
-      return { txid, type: 'contract' };
-
-    } catch(e) {
-      // Jika gagal karena format, coba variasi lain
-      const msg = e?.message || '';
-
-      // Coba value sebagai number (bukan BigInt)
-      if (msg.includes('BigInt') || msg.includes('bigint') || msg.includes('convert')) {
-        try {
-          const result = await prov.signAndBroadcastInteraction({
-            signer:   S.w.address,
-            to:       toAddr,
-            calldata: new Uint8Array([0xd0, 0xe3, 0x0d, 0xb0]),
-            value:    sats,           // number, bukan BigInt
-            feeRate:  5,
-            network:  'testnet',
-          });
-          const txid = typeof result === 'string' ? result
-            : (result?.txid || result?.tx_hash || result?.hash || String(result));
-          return { txid, type: 'contract' };
-        } catch(e2) {
-          console.warn('signAndBroadcastInteraction (number value) gagal:', e2?.message);
-        }
-      }
-
-      // Coba calldata sebagai hex string
-      if (msg.includes('Uint8Array') || msg.includes('Buffer') || msg.includes('calldata')) {
-        try {
-          const result = await prov.signAndBroadcastInteraction({
-            signer:   S.w.address,
-            to:       toAddr,
-            calldata: 'd0e30db0',    // hex string
-            value:    BigInt(sats),
-            feeRate:  5,
-            network:  'testnet',
-          });
-          const txid = typeof result === 'string' ? result
-            : (result?.txid || result?.tx_hash || result?.hash || String(result));
-          return { txid, type: 'contract' };
-        } catch(e3) {
-          console.warn('signAndBroadcastInteraction (hex calldata) gagal:', e3?.message);
-        }
-      }
-
-      // Coba calldata kosong (transfer BTC saja)
-      try {
-        const result = await prov.signAndBroadcastInteraction({
-          signer:   S.w.address,
-          to:       toAddr,
-          calldata: new Uint8Array(0),
-          value:    BigInt(sats),
-          feeRate:  5,
-          network:  'testnet',
-        });
-        const txid = typeof result === 'string' ? result
-          : (result?.txid || result?.tx_hash || result?.hash || String(result));
-        return { txid, type: 'contract' };
-      } catch(e4) {
-        // Lempar error asli + detail
-        throw new Error(`signAndBroadcastInteraction gagal: ${e?.message || e4?.message}`);
-      }
+  let sig = '';
+  try {
+    sig = await prov.signMessage(intent);
+  } catch(e) {
+    // signMessage bisa gagal jika user cancel — lempar error
+    const msg = e?.message || '';
+    if (msg.toLowerCase().includes('cancel') || msg.toLowerCase().includes('reject') || msg.toLowerCase().includes('denied')) {
+      throw new Error('Dibatalkan oleh user');
     }
+    // Jika error lain, lanjut tanpa signature
+    console.warn('signMessage gagal:', msg);
   }
 
-  // ── Fallback: signMessage sebagai proof-of-intent ──
-  if (typeof prov.signMessage === 'function') {
-    const msg = `OpNet Yield Deposit\nPool: ${pool.name}\nAmount: ${amountBTC} tBTC\nTo: ${toAddr}\nSats: ${sats}\nWallet: ${S.w.address}\nTime: ${Date.now()}`;
-    const sig = await prov.signMessage(msg);
-    return { txid: 'sig_' + String(sig).slice(0, 48), type: 'signature' };
-  }
+  // ── Step 2: Buka protokol asli di tab baru ──
+  const url = POOL_URLS[pool.id] || 'https://farm.motoswap.org/menu';
+  setTimeout(() => window.open(url, '_blank', 'noopener'), 800);
 
-  throw new Error('Tidak ada method transaksi yang didukung wallet ini.');
+  const txid = sig ? 'sig_' + String(sig).slice(0, 48) : 'intent_' + Date.now();
+  return { txid, type: 'redirect', url };
 }
 
 // ════════════════════════════════════════════════
@@ -800,27 +723,28 @@ function renderModal() {
 
   else if (step === 'confirm') {
     const sats = Math.floor(parseFloat(amount) * 1e8);
-    const isSign = pool.id === 'moto-stake';
-    const method = isSign ? 'signMessage' : (typeof window.opnet?.signInteraction === 'function' ? 'signInteraction' : 'sendBitcoin');
-    const methodColor = method === 'signInteraction' ? 'var(--btc)' : method === 'sendBitcoin' ? '#a78bfa' : 'var(--gr)';
+    const poolUrl = POOL_URLS[pool.id] || 'https://farm.motoswap.org/menu';
+    const protocolName = pool.id.includes('lp') ? 'Motoswap' : 'MotoChef';
     h = `
     ${stepsH}
-    <div class="mt2">Konfirmasi Transaksi</div>
-    <div class="ms2" style="margin-bottom:16px">Periksa detail, lalu sign di wallet</div>
+    <div class="mt2">Konfirmasi Deposit</div>
+    <div class="ms2" style="margin-bottom:16px">2 langkah mudah</div>
     <div class="cbox">
       <div class="crow"><span>Pool</span><span>${pool.name}</span></div>
-      <div class="crow"><span>Aksi</span><span>${pool.action === 'stake' ? 'Stake' : 'Add Liquidity'}</span></div>
-      <div class="crow"><span>Jumlah</span><span style="color:var(--gr)">${amount} ${pool.token.split('/')[0]}</span></div>
-      ${!isSign ? `<div class="crow"><span>Satoshi</span><span style="font-family:var(--mono);font-size:10px">${sats.toLocaleString()} sats</span></div>` : ''}
+      <div class="crow"><span>Jumlah</span><span style="color:var(--gr)">${amount} tBTC</span></div>
+      <div class="crow"><span>Satoshi</span><span style="font-family:var(--mono);font-size:10px">${sats.toLocaleString()} sats</span></div>
       <div class="crow"><span>APY</span><span style="color:var(--gr)">${pool.apy.toFixed(1)}%</span></div>
       <div class="crow"><span>Network</span><span style="color:var(--ye)">OpNet Testnet 3</span></div>
-      <div class="crow"><span>Metode TX</span><span style="color:${methodColor};font-family:var(--mono);font-size:10px">${method}</span></div>
       <div class="crow"><span>Wallet</span><span style="font-family:var(--mono);font-size:10px">${sa(S.w?.address||'')}</span></div>
     </div>
-    <div class="info-box">✓ Popup <strong>${S.w?.name||'OP_WALLET'}</strong> akan muncul → klik <strong>Confirm</strong> / <strong>Sign</strong> untuk lanjut.</div>
+    <div style="background:rgba(99,179,237,.07);border:1px solid rgba(99,179,237,.25);border-radius:10px;padding:12px 15px;font-size:12px;color:var(--tx);text-align:left;line-height:1.8;margin-top:10px">
+      <strong style="color:var(--btc)">📋 Yang akan terjadi:</strong><br/>
+      <span style="color:var(--mu)">① </span>Wallet popup → <strong>sign intent</strong> (gratis, bukan transaksi)<br/>
+      <span style="color:var(--mu)">② </span>Tab <strong style="color:var(--btc)">${protocolName}</strong> dibuka → deposit di sana
+    </div>
     <div class="macts">
       <button class="bcan" onclick="S.modal.step='input';renderModal()">← Kembali</button>
-      <button class="bok" onclick="doDeposit()">⚡ Sign & Kirim</button>
+      <button class="bok" onclick="doDeposit()">✍️ Sign & Lanjut →</button>
     </div>`;
   }
 
@@ -837,20 +761,21 @@ function renderModal() {
 
   else if (step === 'success') {
     const isSig = txid?.startsWith('sig_');
-    const txtp = S.modal.txType || 'bitcoin';
-    const label = txtp === 'contract' ? '⚡ Smart Contract Berhasil!' : isSig ? '✍️ Intent Tercatat!' : '✅ Transaksi Berhasil!';
-    const typeLabel = txtp === 'contract' ? 'signInteraction (L2 Contract Call)' : isSig ? 'signMessage (Intent Proof)' : 'sendBitcoin (L1 Transfer)';
+    const txtp = S.modal.txType || 'redirect';
+    const poolUrl = POOL_URLS[pool.id] || 'https://farm.motoswap.org/menu';
+    const protocolName = pool.id.includes('moto-lp') || pool.id === 'moto-pill-lp' ? 'Motoswap' : 'MotoChef';
     h = `
     ${stepsH}
     <div class="mctr">
       <div class="sok">✓</div>
-      <div style="font-size:17px;font-weight:800">${label}</div>
-      <div style="font-size:13px;color:var(--mu)">${amount} ${pool.token.split('/')[0]} → ${pool.name}</div>
-      <div style="font-size:10px;color:var(--btc);font-family:var(--mono);background:var(--dim);border:1px solid var(--bdr);border-radius:5px;padding:3px 9px">${typeLabel}</div>
-      ${txid && !isSig ? `
-      <div style="font-size:10px;color:var(--mu);font-family:var(--mono);word-break:break-all;max-width:320px;text-align:center;line-height:1.6">TxID:<br/>${txid.slice(0,36)}…</div>
-      <a class="txlnk" href="${EXPLORER}/tx/${txid}" target="_blank" rel="noopener noreferrer">🔍 Lihat di OPScan ↗</a>` : ''}
-      ${isSig ? `<div style="font-size:11px;color:var(--mu);max-width:290px;text-align:center;line-height:1.6">Intent tersimpan. Untuk stake MOTO, kamu perlu token MOTO terlebih dahulu. Swap tBTC → MOTO di <a href="${MOTOSWAP}" target="_blank" style="color:var(--btc)">motoswap.org</a></div>` : ''}
+      <div style="font-size:17px;font-weight:800">Intent Tersimpan!</div>
+      <div style="font-size:13px;color:var(--mu)">${amount} tBTC → ${pool.name}</div>
+      <div style="background:rgba(255,200,0,.07);border:1px solid rgba(255,200,0,.25);border-radius:10px;padding:13px 16px;font-size:12px;color:var(--tx);text-align:left;max-width:310px;line-height:1.8">
+        <strong style="color:var(--ye)">📋 Langkah selanjutnya:</strong><br/>
+        Intent sudah ditandatangani dengan wallet kamu.<br/>
+        Tab <strong style="color:var(--btc)">${protocolName}</strong> sudah dibuka — selesaikan deposit di sana dengan jumlah yang sama.
+      </div>
+      <a class="txlnk" href="${poolUrl}" target="_blank" rel="noopener noreferrer" style="margin-top:4px">🔗 Buka ${protocolName} ↗</a>
       <button class="bok" onclick="closeModal()" style="margin-top:8px;flex:none;padding:10px 28px">✓ Selesai</button>
     </div>`;
   }
