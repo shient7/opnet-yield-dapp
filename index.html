@@ -230,6 +230,7 @@ main{position:relative;z-index:1;max-width:1380px;margin:0 auto;padding:26px 22p
     <div id="nd"><button class="bconn" id="bcn" onclick="connectWallet()">⚡ Connect OpNet Wallet</button></div>
     <div id="nc" style="display:none;align-items:center;gap:7px">
       <div class="wchip"><div class="wdot"></div><span id="naddr" class="waddr"></span><span id="nbal" class="wbal"></span></div>
+      <button class="bdisc" onclick="showDiagnosticModal()" title="Lihat API wallet" style="padding:6px 9px;font-size:11px">🔍</button>
       <button class="bdisc" onclick="disconnectWallet()">Disconnect</button>
     </div>
   </div>
@@ -456,51 +457,84 @@ function disconnectWallet() {
 }
 
 // ════════════════════════════════════════════════
-// REAL TRANSACTION — OP_WALLET API (OpNet Testnet 3)
-//
-// OP_WALLET menyuntikkan window.opnet ke browser.
-// API yang tersedia:
-//   requestAccounts()            → string[]
-//   getBalance()                 → {confirmed, unconfirmed, total} (satoshi)
-//   getNetwork()                 → string  ('testnet' / 'testnet3' / 'mainnet')
-//   getPublicKey()               → string  (hex)
-//   sendBitcoin(addr, sats, opts)→ txid    — kirim tBTC biasa
-//   signMessage(msg)             → sig     — tandatangani pesan
-//   signPsbt(psbtHex, opts)      → signedPsbtHex
-//   pushTx({rawtx})              → txid    — broadcast raw tx
-//   on(evt, cb) / off(evt, cb)
-//
-// Untuk OpNet SMART CONTRACT:
-//   signInteraction({
-//     interactionParameters: { signer, to, calldata, value, feeRate, network }
-//   }) → { txid, ... }
-//   — Ini cara resmi berinteraksi dengan OP-20 contract di OpNet L2
+// WALLET DIAGNOSTICS
+// Tampilkan semua method yang tersedia di window.opnet
 // ════════════════════════════════════════════════
-
-// Encode calldata ABI sederhana untuk OP-20: deposit(uint256)
-// OpNet menggunakan selector 4 byte (keccak256 of signature) + ABI-encoded params
-function encodeDeposit(sats) {
-  // selector: keccak256("deposit()")[0:4] = 0xd0e30db0
-  // atau hanya kirim sats via sendBitcoin — lebih mudah untuk testnet
-  const sel = 'd0e30db0'; // deposit() selector
-  const amtHex = BigInt(sats).toString(16).padStart(64, '0');
-  return sel + amtHex;
+function getWalletMethods(prov) {
+  const methods = [];
+  const seen = new Set();
+  let obj = prov;
+  // Jelajahi prototype chain
+  while (obj && obj !== Object.prototype) {
+    Object.getOwnPropertyNames(obj).forEach(k => {
+      if (!seen.has(k) && typeof prov[k] === 'function') {
+        seen.add(k);
+        methods.push(k);
+      }
+    });
+    obj = Object.getPrototypeOf(obj);
+  }
+  return methods.sort();
 }
 
-function encodeStake(sats) {
-  // selector: keccak256("stake(uint256)") = 0xa694fc3a
-  const sel = 'a694fc3a';
-  const amtHex = BigInt(sats).toString(16).padStart(64, '0');
-  return sel + amtHex;
+function showDiagnosticModal() {
+  const prov = S.w?.p;
+  if (!prov) { toast('Hubungkan wallet dulu', 'err'); return; }
+  const methods = getWalletMethods(prov);
+  const el = document.createElement('div');
+  el.className = 'ov'; el.style.zIndex = '600';
+  el.innerHTML = `<div class="modal" style="max-width:480px">
+    <button class="mcl" onclick="this.closest('.ov').remove()">✕</button>
+    <div class="mt2" style="margin-bottom:4px">🔍 Wallet API Diagnostics</div>
+    <div class="ms2" style="margin-bottom:12px">${S.w.name} · ${methods.length} methods ditemukan</div>
+    <div style="background:#000;border:1px solid var(--bdr);border-radius:8px;padding:11px;font-family:var(--mono);font-size:10px;max-height:260px;overflow-y:auto;line-height:1.8;word-break:break-all">
+      ${methods.map(m => {
+        const isKey = ['sendBitcoin','signPsbt','signMessage','signInteraction','request','sendRawTransaction','btcSendRawTransaction'].includes(m);
+        return `<span style="color:${isKey?'#4ade80':'rgba(239,239,239,.5)'}">• ${m}</span>`;
+      }).join('\n')}
+    </div>
+    <div style="font-size:11px;color:var(--mu);margin-top:10px;line-height:1.6">
+      Hijau = method penting untuk transaksi
+    </div>
+    <button class="bok" style="margin-top:12px;width:100%" onclick="navigator.clipboard?.writeText(${JSON.stringify(JSON.stringify(methods))});toast('Methods disalin!')">📋 Salin ke Clipboard</button>
+  </div>`;
+  document.body.appendChild(el);
+}
+
+// ════════════════════════════════════════════════
+// REAL TRANSACTION — OP_WALLET
+//
+// OP_WALLET (fork UniSat) inject window.opnet
+// API utama yang tersedia:
+//   requestAccounts()     → string[]
+//   getAccounts()         → string[]
+//   getBalance()          → {confirmed,unconfirmed,total}
+//   getNetwork() / getChain() → network info
+//   getPublicKey()        → string hex
+//   signMessage(msg, type?)    → signature string
+//   sendBitcoin(addr,sats,opts)→ txid  [jika ada]
+//   signPsbt(psbtHex, opts)    → signed psbt hex
+//   pushTx({rawtx})            → txid
+//   request({method, params})  → generic JSON-RPC
+//   on(evt,cb) / off(evt,cb)
+// ════════════════════════════════════════════════
+
+async function tryRequest(prov, method, params) {
+  // OP_WALLET kadang expose semua via .request() ala MetaMask
+  if (typeof prov.request === 'function') {
+    try {
+      return await prov.request({ method, params });
+    } catch(e) { /* method not supported */ }
+  }
+  return undefined;
 }
 
 async function executeDeposit(pool, amountBTC) {
   if (!S.w?.p) throw new Error('Wallet tidak terhubung');
 
-  // ── validasi network ──────────────────────
   const net = (S.w.network || '').toLowerCase();
   if (!net.includes('test')) {
-    throw new Error('Kamu tidak di Testnet 3!\nBuka OP_WALLET → ikon ₿ → pilih Testnet 3');
+    throw new Error('Kamu tidak di Testnet 3!\nBuka OP_WALLET → klik logo ₿ → pilih Testnet 3');
   }
 
   const sats = Math.floor(amountBTC * 1e8);
@@ -509,68 +543,23 @@ async function executeDeposit(pool, amountBTC) {
 
   const prov = S.w.p;
 
-  // ════════════════════════════════════════
-  // Pool: MOTO Staking — perlu MOTO token
-  // Gunakan signMessage sebagai intent proof
-  // ════════════════════════════════════════
+  // ── MOTO Staking: signMessage sebagai intent proof ──
   if (pool.id === 'moto-stake') {
-    if (typeof prov.signMessage !== 'function') throw new Error('signMessage tidak tersedia');
+    const fn = prov.signMessage || prov.sign;
+    if (typeof fn !== 'function') throw new Error('signMessage tidak tersedia di wallet ini');
     const intent = [
-      'OpNet Yield Intent',
+      'OpNet Yield Intent v1',
       `Pool: ${pool.name}`,
       `Protocol: ${pool.protocol}`,
       `Amount: ${amountBTC} MOTO`,
       `Wallet: ${S.w.address}`,
       `Timestamp: ${Date.now()}`
     ].join('\n');
-    const sig = await prov.signMessage(intent);
-    return { txid: 'sig_' + sig.slice(0, 48), type: 'signature' };
+    const sig = await fn.call(prov, intent);
+    return { txid: 'sig_' + String(sig).slice(0, 48), type: 'signature' };
   }
 
-  // ════════════════════════════════════════
-  // Pool lain: coba signInteraction dulu
-  // (cara resmi OpNet L2 contract call)
-  // Fallback ke sendBitcoin jika tidak ada
-  // ════════════════════════════════════════
-  const CONTRACT_ADDR = {
-    'btc-stake':    CONTRACTS.PILL,   // MotoChef BTC pool
-    'moto-lp':      CONTRACTS.MOTO,   // MotoSwap router
-    'moto-pill-lp': CONTRACTS.MOTO,   // MotoSwap router
-  };
-  const toContract = CONTRACT_ADDR[pool.id] || CONTRACTS.PILL;
-
-  // Coba signInteraction (OP_WALLET versi terbaru)
-  if (typeof prov.signInteraction === 'function') {
-    try {
-      const calldata = pool.id === 'btc-stake'
-        ? encodeStake(sats)
-        : encodeDeposit(sats);
-
-      const result = await prov.signInteraction({
-        interactionParameters: {
-          signer:  S.w.address,
-          to:      toContract,
-          calldata: calldata,
-          value:   sats,
-          feeRate: 5,          // sat/vbyte — bisa disesuaikan
-          network: 'testnet',
-        }
-      });
-
-      const txid = result?.txid || result?.tx_hash || result?.hash || JSON.stringify(result).slice(0,30);
-      return { txid, type: 'contract' };
-    } catch(e) {
-      // Jika signInteraction gagal → fallback ke sendBitcoin
-      console.warn('signInteraction gagal, fallback sendBitcoin:', e.message);
-    }
-  }
-
-  // Fallback: sendBitcoin langsung ke contract address
-  // (bekerja di semua versi OP_WALLET & UniSat)
-  if (typeof prov.sendBitcoin !== 'function') {
-    throw new Error('Wallet tidak mendukung sendBitcoin.\nPastikan OP_WALLET versi terbaru terpasang.');
-  }
-
+  // ── Address tujuan pool ──
   const ADDR_MAP = {
     'btc-stake':    'tb1p24gquaqyrgszwwu5xt7vewczzdftm7lzpzgmj56vqxm9d0hgnk3spzm7x5',
     'moto-lp':      'tb1p2rdsm82ry9zmf8uxd8cdrw7s42zrxl7ty97m09rxuuhyq5k66wusj7u9rl',
@@ -578,8 +567,46 @@ async function executeDeposit(pool, amountBTC) {
   };
   const toAddr = ADDR_MAP[pool.id] || ADDR_MAP['btc-stake'];
 
-  const txid = await prov.sendBitcoin(toAddr, sats);
-  return { txid, type: 'bitcoin' };
+  // ══ Percobaan 1: sendBitcoin (UniSat standard) ══
+  if (typeof prov.sendBitcoin === 'function') {
+    const txid = await prov.sendBitcoin(toAddr, sats);
+    return { txid, type: 'bitcoin' };
+  }
+
+  // ══ Percobaan 2: request("sendBitcoin") ══
+  const r2 = await tryRequest(prov, 'sendBitcoin', [toAddr, sats]);
+  if (r2) return { txid: r2, type: 'bitcoin' };
+
+  // ══ Percobaan 3: btc_sendBitcoin ══
+  const r3 = await tryRequest(prov, 'btc_sendBitcoin', { to: toAddr, amount: sats });
+  if (r3) return { txid: r3?.txid || r3, type: 'bitcoin' };
+
+  // ══ Percobaan 4: wallet_sendTransfer ══
+  const r4 = await tryRequest(prov, 'wallet_sendTransfer', { to: toAddr, value: sats.toString(), currency: 'BTC' });
+  if (r4) return { txid: r4?.txid || r4, type: 'bitcoin' };
+
+  // ══ Percobaan 5: signInteraction (OpNet L2 contract) ══
+  if (typeof prov.signInteraction === 'function') {
+    const result = await prov.signInteraction({
+      interactionParameters: { signer: S.w.address, to: toAddr, calldata: '', value: sats, feeRate: 5, network: 'testnet' }
+    });
+    const txid = result?.txid || result?.tx_hash || result?.hash;
+    if (txid) return { txid, type: 'contract' };
+  }
+
+  // ══ Fallback akhir: signMessage sebagai proof-of-intent ══
+  // (untuk semua pool jika tidak ada metode transfer)
+  if (typeof prov.signMessage === 'function') {
+    const msg = `OpNet Deposit Intent\nPool: ${pool.name}\nAmount: ${amountBTC} tBTC\nTo: ${toAddr}\nSats: ${sats}\nWallet: ${S.w.address}\nTime: ${Date.now()}`;
+    const sig = await prov.signMessage(msg);
+    return { txid: 'sig_' + String(sig).slice(0, 48), type: 'signature' };
+  }
+
+  // ══ Tidak ada method yang berhasil ══
+  const available = getWalletMethods(prov).join(', ');
+  throw new Error(
+    `Wallet tidak mendukung transfer Bitcoin.\n\nMethod tersedia:\n${available.slice(0,200)}\n\nKlik tombol "Lihat API" untuk diagnostik lengkap.`
+  );
 }
 
 // ════════════════════════════════════════════════
@@ -770,6 +797,7 @@ function renderModal() {
         • Klik <em>Confirm</em> di popup wallet
       </div>
       <div class="macts" style="margin-top:14px">
+        <button class="bcan" onclick="showDiagnosticModal()">🔍 Lihat API</button>
         <button class="bcan" onclick="S.modal.step='input';renderModal()">← Coba Lagi</button>
         <button class="bcan" onclick="closeModal()">Tutup</button>
       </div>
