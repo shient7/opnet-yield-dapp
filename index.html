@@ -360,37 +360,63 @@ async function connectWallet() {
   }
 
   try {
-    // 1) Request accounts → buka popup wallet
-    const accounts = await prov.p.requestAccounts();
-    if (!accounts?.length) throw new Error('Tidak ada akun');
+    // 1) Request accounts — OP_WALLET bisa return array, string, atau object
+    let raw;
+    try { raw = await prov.p.requestAccounts(); } catch(e) {}
+    if (!raw) {
+      try { raw = await prov.p.getAccounts(); } catch(e) {}
+    }
+    // Normalize ke array
+    let accounts = [];
+    if (Array.isArray(raw))         accounts = raw;
+    else if (typeof raw === 'string' && raw.length > 0) accounts = [raw];
+    else if (raw?.address)          accounts = [raw.address];
+    else if (raw?.accounts)         accounts = Array.isArray(raw.accounts) ? raw.accounts : [raw.accounts];
+
+    if (!accounts.length) throw new Error('Tidak ada akun yang tersedia. Buat wallet dulu di OP_WALLET.');
     const address = accounts[0];
 
-    // 2) Baca network
+    // 2) Baca network — bisa string atau object
     let network = 'unknown';
-    try { network = await prov.p.getNetwork(); } catch(e) {}
+    try {
+      let n = await prov.p.getNetwork();
+      if (typeof n === 'string')         network = n;
+      else if (n?.network)               network = n.network;
+      else if (n?.name)                  network = n.name;
+      else if (n?.chain)                 network = String(n.chain);
+      else                               network = String(n ?? 'unknown');
+    } catch(e) {}
+    // OP_WALLET bisa juga pakai getChain()
+    if (network === 'unknown') {
+      try {
+        let c = await prov.p.getChain?.();
+        if (c?.network) network = c.network;
+        else if (c?.enum) network = c.enum;
+      } catch(e) {}
+    }
 
-    // 3) Baca balance (dalam satoshi)
+    // 3) Baca balance — bisa {confirmed,total,...} atau number langsung
     let sats = 0;
     try {
       const b = await prov.p.getBalance();
-      sats = b.total ?? b.confirmed ?? 0;
+      if (typeof b === 'number')          sats = b;
+      else if (typeof b === 'string')     sats = parseInt(b) || 0;
+      else if (b != null)                 sats = b.total ?? b.confirmed ?? b.balance ?? 0;
     } catch(e) {}
 
-    // 4) Baca public key (untuk OP_NET contract interaction)
+    // 4) Public key
     let pubkey = '';
-    try { pubkey = await prov.p.getPublicKey(); } catch(e) {}
+    try { pubkey = await prov.p.getPublicKey() || ''; } catch(e) {}
 
-    S.w = { address, network, balance: sats/1e8, pubkey, p: prov.p, name: prov.name };
+    S.w = { address, network, balance: sats / 1e8, pubkey, p: prov.p, name: prov.name };
 
-    // Periksa network
-    const ok = network?.toLowerCase().includes('test') || network === 'testnet3';
+    const ok = network?.toLowerCase().includes('test');
     if (!ok) toast('⚠️ Ganti ke Testnet 3 di wallet kamu!', 'wrn');
 
     updateNav();
     toast(`✓ ${prov.name} terhubung! ${sa(address)}`);
     renderPage();
 
-    // Event listeners
     try { prov.p.on('accountsChanged', onAcc); } catch(e) {}
     try { prov.p.on('networkChanged',  onNet); } catch(e) {}
 
@@ -398,17 +424,22 @@ async function connectWallet() {
     btn.disabled = false;
     btn.innerHTML = '⚡ Connect OpNet Wallet';
     const msg = err?.message || '';
-    if (err?.code === 4001 || msg.includes('reject') || msg.includes('cancel') || msg.includes('User denied')) {
+    if (err?.code === 4001 || msg.includes('reject') || msg.includes('cancel') || msg.includes('denied')) {
       toast('Koneksi dibatalkan', 'err');
     } else {
-      toast('Gagal: ' + msg.slice(0,60), 'err');
+      toast('Gagal: ' + msg.slice(0, 80), 'err');
     }
   }
 }
 
 async function onAcc(accounts) {
-  if (!accounts?.length) { disconnectWallet(); return; }
-  S.w.address = accounts[0];
+  // accounts bisa array, string, atau object
+  let addr = '';
+  if (Array.isArray(accounts))             addr = accounts[0] || '';
+  else if (typeof accounts === 'string')   addr = accounts;
+  else if (accounts?.address)              addr = accounts.address;
+  if (!addr) { disconnectWallet(); return; }
+  S.w.address = addr;
   await refreshBal();
   updateNav();
   renderPage();
@@ -427,7 +458,11 @@ async function refreshBal() {
   if (!S.w?.p) return;
   try {
     const b = await S.w.p.getBalance();
-    S.w.balance = (b.total ?? b.confirmed ?? 0) / 1e8;
+    let sats = 0;
+    if (typeof b === 'number')      sats = b;
+    else if (typeof b === 'string') sats = parseInt(b) || 0;
+    else if (b != null)             sats = b.total ?? b.confirmed ?? b.balance ?? 0;
+    S.w.balance = sats / 1e8;
     updateNav();
   } catch(e) {}
 }
