@@ -539,30 +539,17 @@ function showDiagnosticModal() {
 // ════════════════════════════════════════════════
 // REAL TRANSACTION — OP_WALLET
 //
-// OP_WALLET (fork UniSat) inject window.opnet
-// API utama yang tersedia:
-//   requestAccounts()     → string[]
-//   getAccounts()         → string[]
-//   getBalance()          → {confirmed,unconfirmed,total}
-//   getNetwork() / getChain() → network info
-//   getPublicKey()        → string hex
-//   signMessage(msg, type?)    → signature string
-//   sendBitcoin(addr,sats,opts)→ txid  [jika ada]
-//   signPsbt(psbtHex, opts)    → signed psbt hex
-//   pushTx({rawtx})            → txid
-//   request({method, params})  → generic JSON-RPC
-//   on(evt,cb) / off(evt,cb)
+// Method yang tersedia di window.opnet (confirmed dari diagnostik):
+//   requestAccounts, getAccounts, getBalance, getNetwork, getChain
+//   getPublicKey, getMLDSAPublicKey, getVersion
+//   signMessage, signData, signInteraction
+//   signAndBroadcastInteraction  ← METHOD UTAMA untuk contract call
+//   deployContract, cancelTransaction
+//   switchChain, switchNetwork, disconnect
+//   pushTx, getBitcoinUtxos
+//   on, off, once, emit, broadcast
+//   verifyMLDSASignature, verifyMessageOfBIP322Simple, signMLDSAMessage
 // ════════════════════════════════════════════════
-
-async function tryRequest(prov, method, params) {
-  // OP_WALLET kadang expose semua via .request() ala MetaMask
-  if (typeof prov.request === 'function') {
-    try {
-      return await prov.request({ method, params });
-    } catch(e) { /* method not supported */ }
-  }
-  return undefined;
-}
 
 async function executeDeposit(pool, amountBTC) {
   if (!S.w?.p) throw new Error('Wallet tidak terhubung');
@@ -573,75 +560,127 @@ async function executeDeposit(pool, amountBTC) {
   }
 
   const sats = Math.floor(amountBTC * 1e8);
-  if (sats < 546) throw new Error('Minimum 546 satoshi (~0.00000546 tBTC)');
-  if (amountBTC > S.w.balance) throw new Error(`Saldo tidak cukup.\nKamu punya: ${S.w.balance.toFixed(6)} tBTC`);
+  if (sats < 546) throw new Error('Minimum 546 satoshi');
+  if (amountBTC > S.w.balance) throw new Error(`Saldo tidak cukup. Kamu punya: ${S.w.balance.toFixed(6)} tBTC`);
 
   const prov = S.w.p;
 
-  // ── MOTO Staking: signMessage sebagai intent proof ──
-  if (pool.id === 'moto-stake') {
-    const fn = prov.signMessage || prov.sign;
-    if (typeof fn !== 'function') throw new Error('signMessage tidak tersedia di wallet ini');
-    const intent = [
-      'OpNet Yield Intent v1',
-      `Pool: ${pool.name}`,
-      `Protocol: ${pool.protocol}`,
-      `Amount: ${amountBTC} MOTO`,
-      `Wallet: ${S.w.address}`,
-      `Timestamp: ${Date.now()}`
-    ].join('\n');
-    const sig = await fn.call(prov, intent);
-    return { txid: 'sig_' + String(sig).slice(0, 48), type: 'signature' };
-  }
-
-  // ── Address tujuan pool ──
+  // ── Contract addresses pool ──
   const ADDR_MAP = {
     'btc-stake':    'tb1p24gquaqyrgszwwu5xt7vewczzdftm7lzpzgmj56vqxm9d0hgnk3spzm7x5',
     'moto-lp':      'tb1p2rdsm82ry9zmf8uxd8cdrw7s42zrxl7ty97m09rxuuhyq5k66wusj7u9rl',
     'moto-pill-lp': 'tb1p2rdsm82ry9zmf8uxd8cdrw7s42zrxl7ty97m09rxuuhyq5k66wusj7u9rl',
+    'moto-stake':   'tb1p2rdsm82ry9zmf8uxd8cdrw7s42zrxl7ty97m09rxuuhyq5k66wusj7u9rl',
   };
   const toAddr = ADDR_MAP[pool.id] || ADDR_MAP['btc-stake'];
 
-  // ══ Percobaan 1: sendBitcoin (UniSat standard) ══
-  if (typeof prov.sendBitcoin === 'function') {
-    const txid = await prov.sendBitcoin(toAddr, sats);
-    return { txid, type: 'bitcoin' };
+  // ══════════════════════════════════════════════
+  // METHOD UTAMA: signAndBroadcastInteraction
+  // Format InteractionParameters (dari @btc-vision/transaction):
+  // {
+  //   signer: string,        ← alamat wallet
+  //   to: string,            ← contract address
+  //   calldata: Uint8Array,  ← encoded function call (bisa kosong)
+  //   value: bigint,         ← satoshi sebagai BigInt
+  //   feeRate: number,       ← sat/vbyte
+  //   network: 'testnet'|'mainnet'|'regtest'
+  // }
+  // ══════════════════════════════════════════════
+  if (typeof prov.signAndBroadcastInteraction === 'function') {
+    try {
+      // calldata: deposit() selector = 0xd0e30db0
+      // Encode sebagai Uint8Array
+      const selector = new Uint8Array([0xd0, 0xe3, 0x0d, 0xb0]);
+
+      const params = {
+        signer:   S.w.address,
+        to:       toAddr,
+        calldata: selector,
+        value:    BigInt(sats),
+        feeRate:  5,
+        network:  'testnet',
+      };
+
+      const result = await prov.signAndBroadcastInteraction(params);
+
+      // result bisa berupa string txid, atau object {txid, ...}
+      const txid = typeof result === 'string'
+        ? result
+        : (result?.txid || result?.tx_hash || result?.hash || result?.transactionId
+           || result?.id || JSON.stringify(result).slice(0, 64));
+
+      return { txid, type: 'contract' };
+
+    } catch(e) {
+      // Jika gagal karena format, coba variasi lain
+      const msg = e?.message || '';
+
+      // Coba value sebagai number (bukan BigInt)
+      if (msg.includes('BigInt') || msg.includes('bigint') || msg.includes('convert')) {
+        try {
+          const result = await prov.signAndBroadcastInteraction({
+            signer:   S.w.address,
+            to:       toAddr,
+            calldata: new Uint8Array([0xd0, 0xe3, 0x0d, 0xb0]),
+            value:    sats,           // number, bukan BigInt
+            feeRate:  5,
+            network:  'testnet',
+          });
+          const txid = typeof result === 'string' ? result
+            : (result?.txid || result?.tx_hash || result?.hash || String(result));
+          return { txid, type: 'contract' };
+        } catch(e2) {
+          console.warn('signAndBroadcastInteraction (number value) gagal:', e2?.message);
+        }
+      }
+
+      // Coba calldata sebagai hex string
+      if (msg.includes('Uint8Array') || msg.includes('Buffer') || msg.includes('calldata')) {
+        try {
+          const result = await prov.signAndBroadcastInteraction({
+            signer:   S.w.address,
+            to:       toAddr,
+            calldata: 'd0e30db0',    // hex string
+            value:    BigInt(sats),
+            feeRate:  5,
+            network:  'testnet',
+          });
+          const txid = typeof result === 'string' ? result
+            : (result?.txid || result?.tx_hash || result?.hash || String(result));
+          return { txid, type: 'contract' };
+        } catch(e3) {
+          console.warn('signAndBroadcastInteraction (hex calldata) gagal:', e3?.message);
+        }
+      }
+
+      // Coba calldata kosong (transfer BTC saja)
+      try {
+        const result = await prov.signAndBroadcastInteraction({
+          signer:   S.w.address,
+          to:       toAddr,
+          calldata: new Uint8Array(0),
+          value:    BigInt(sats),
+          feeRate:  5,
+          network:  'testnet',
+        });
+        const txid = typeof result === 'string' ? result
+          : (result?.txid || result?.tx_hash || result?.hash || String(result));
+        return { txid, type: 'contract' };
+      } catch(e4) {
+        // Lempar error asli + detail
+        throw new Error(`signAndBroadcastInteraction gagal: ${e?.message || e4?.message}`);
+      }
+    }
   }
 
-  // ══ Percobaan 2: request("sendBitcoin") ══
-  const r2 = await tryRequest(prov, 'sendBitcoin', [toAddr, sats]);
-  if (r2) return { txid: r2, type: 'bitcoin' };
-
-  // ══ Percobaan 3: btc_sendBitcoin ══
-  const r3 = await tryRequest(prov, 'btc_sendBitcoin', { to: toAddr, amount: sats });
-  if (r3) return { txid: r3?.txid || r3, type: 'bitcoin' };
-
-  // ══ Percobaan 4: wallet_sendTransfer ══
-  const r4 = await tryRequest(prov, 'wallet_sendTransfer', { to: toAddr, value: sats.toString(), currency: 'BTC' });
-  if (r4) return { txid: r4?.txid || r4, type: 'bitcoin' };
-
-  // ══ Percobaan 5: signInteraction (OpNet L2 contract) ══
-  if (typeof prov.signInteraction === 'function') {
-    const result = await prov.signInteraction({
-      interactionParameters: { signer: S.w.address, to: toAddr, calldata: '', value: sats, feeRate: 5, network: 'testnet' }
-    });
-    const txid = result?.txid || result?.tx_hash || result?.hash;
-    if (txid) return { txid, type: 'contract' };
-  }
-
-  // ══ Fallback akhir: signMessage sebagai proof-of-intent ══
-  // (untuk semua pool jika tidak ada metode transfer)
+  // ── Fallback: signMessage sebagai proof-of-intent ──
   if (typeof prov.signMessage === 'function') {
-    const msg = `OpNet Deposit Intent\nPool: ${pool.name}\nAmount: ${amountBTC} tBTC\nTo: ${toAddr}\nSats: ${sats}\nWallet: ${S.w.address}\nTime: ${Date.now()}`;
+    const msg = `OpNet Yield Deposit\nPool: ${pool.name}\nAmount: ${amountBTC} tBTC\nTo: ${toAddr}\nSats: ${sats}\nWallet: ${S.w.address}\nTime: ${Date.now()}`;
     const sig = await prov.signMessage(msg);
     return { txid: 'sig_' + String(sig).slice(0, 48), type: 'signature' };
   }
 
-  // ══ Tidak ada method yang berhasil ══
-  const available = getWalletMethods(prov).join(', ');
-  throw new Error(
-    `Wallet tidak mendukung transfer Bitcoin.\n\nMethod tersedia:\n${available.slice(0,200)}\n\nKlik tombol "Lihat API" untuk diagnostik lengkap.`
-  );
+  throw new Error('Tidak ada method transaksi yang didukung wallet ini.');
 }
 
 // ════════════════════════════════════════════════
