@@ -456,55 +456,130 @@ function disconnectWallet() {
 }
 
 // ════════════════════════════════════════════════
-// REAL TRANSACTION — OP_WALLET API
+// REAL TRANSACTION — OP_WALLET API (OpNet Testnet 3)
+//
+// OP_WALLET menyuntikkan window.opnet ke browser.
+// API yang tersedia:
+//   requestAccounts()            → string[]
+//   getBalance()                 → {confirmed, unconfirmed, total} (satoshi)
+//   getNetwork()                 → string  ('testnet' / 'testnet3' / 'mainnet')
+//   getPublicKey()               → string  (hex)
+//   sendBitcoin(addr, sats, opts)→ txid    — kirim tBTC biasa
+//   signMessage(msg)             → sig     — tandatangani pesan
+//   signPsbt(psbtHex, opts)      → signedPsbtHex
+//   pushTx({rawtx})              → txid    — broadcast raw tx
+//   on(evt, cb) / off(evt, cb)
+//
+// Untuk OpNet SMART CONTRACT:
+//   signInteraction({
+//     interactionParameters: { signer, to, calldata, value, feeRate, network }
+//   }) → { txid, ... }
+//   — Ini cara resmi berinteraksi dengan OP-20 contract di OpNet L2
 // ════════════════════════════════════════════════
+
+// Encode calldata ABI sederhana untuk OP-20: deposit(uint256)
+// OpNet menggunakan selector 4 byte (keccak256 of signature) + ABI-encoded params
+function encodeDeposit(sats) {
+  // selector: keccak256("deposit()")[0:4] = 0xd0e30db0
+  // atau hanya kirim sats via sendBitcoin — lebih mudah untuk testnet
+  const sel = 'd0e30db0'; // deposit() selector
+  const amtHex = BigInt(sats).toString(16).padStart(64, '0');
+  return sel + amtHex;
+}
+
+function encodeStake(sats) {
+  // selector: keccak256("stake(uint256)") = 0xa694fc3a
+  const sel = 'a694fc3a';
+  const amtHex = BigInt(sats).toString(16).padStart(64, '0');
+  return sel + amtHex;
+}
 
 async function executeDeposit(pool, amountBTC) {
   if (!S.w?.p) throw new Error('Wallet tidak terhubung');
 
-  const net = S.w.network || '';
-  if (!net.toLowerCase().includes('test')) {
-    throw new Error('Kamu tidak di Testnet 3! Buka wallet → klik logo Bitcoin → pilih Testnet 3');
+  // ── validasi network ──────────────────────
+  const net = (S.w.network || '').toLowerCase();
+  if (!net.includes('test')) {
+    throw new Error('Kamu tidak di Testnet 3!\nBuka OP_WALLET → ikon ₿ → pilih Testnet 3');
   }
 
   const sats = Math.floor(amountBTC * 1e8);
   if (sats < 546) throw new Error('Minimum 546 satoshi (~0.00000546 tBTC)');
-  if (amountBTC > S.w.balance) throw new Error(`Saldo tidak cukup. Kamu punya: ${S.w.balance.toFixed(6)} tBTC`);
+  if (amountBTC > S.w.balance) throw new Error(`Saldo tidak cukup.\nKamu punya: ${S.w.balance.toFixed(6)} tBTC`);
 
-  // ──────────────────────────────────────────
-  // tBTC Staking & MOTO-LP: pakai sendBitcoin
-  // MotoChef testnet menerima tBTC langsung
-  // Contract address MotoChef BTC staking pool
-  // ──────────────────────────────────────────
-  const MOTOCHEF_BTC_POOL = 'tb1p24gquaqyrgszwwu5xt7vewczzdftm7lzpzgmj56vqxm9d0hgnk3spzm7x5';
-  const MOTOSWAP_ROUTER   = 'tb1p2rdsm82ry9zmf8uxd8cdrw7s42zrxl7ty97m09rxuuhyq5k66wusj7u9rl';
+  const prov = S.w.p;
 
-  let toAddr;
-  if (pool.id === 'btc-stake') {
-    toAddr = MOTOCHEF_BTC_POOL;
-  } else if (pool.id === 'moto-lp' || pool.id === 'moto-pill-lp') {
-    toAddr = MOTOSWAP_ROUTER;
-  } else {
-    // MOTO Staking: signMessage sebagai intent (perlu MOTO token dulu)
-    if (typeof S.w.p.signMessage === 'function') {
-      const intent = `OpNet Yield Stake\nPool: ${pool.name}\nAmount: ${amountBTC}\nWallet: ${S.w.address}\nTs: ${Date.now()}`;
-      const sig = await S.w.p.signMessage(intent);
-      return 'sig_' + sig.slice(0, 40);
+  // ════════════════════════════════════════
+  // Pool: MOTO Staking — perlu MOTO token
+  // Gunakan signMessage sebagai intent proof
+  // ════════════════════════════════════════
+  if (pool.id === 'moto-stake') {
+    if (typeof prov.signMessage !== 'function') throw new Error('signMessage tidak tersedia');
+    const intent = [
+      'OpNet Yield Intent',
+      `Pool: ${pool.name}`,
+      `Protocol: ${pool.protocol}`,
+      `Amount: ${amountBTC} MOTO`,
+      `Wallet: ${S.w.address}`,
+      `Timestamp: ${Date.now()}`
+    ].join('\n');
+    const sig = await prov.signMessage(intent);
+    return { txid: 'sig_' + sig.slice(0, 48), type: 'signature' };
+  }
+
+  // ════════════════════════════════════════
+  // Pool lain: coba signInteraction dulu
+  // (cara resmi OpNet L2 contract call)
+  // Fallback ke sendBitcoin jika tidak ada
+  // ════════════════════════════════════════
+  const CONTRACT_ADDR = {
+    'btc-stake':    CONTRACTS.PILL,   // MotoChef BTC pool
+    'moto-lp':      CONTRACTS.MOTO,   // MotoSwap router
+    'moto-pill-lp': CONTRACTS.MOTO,   // MotoSwap router
+  };
+  const toContract = CONTRACT_ADDR[pool.id] || CONTRACTS.PILL;
+
+  // Coba signInteraction (OP_WALLET versi terbaru)
+  if (typeof prov.signInteraction === 'function') {
+    try {
+      const calldata = pool.id === 'btc-stake'
+        ? encodeStake(sats)
+        : encodeDeposit(sats);
+
+      const result = await prov.signInteraction({
+        interactionParameters: {
+          signer:  S.w.address,
+          to:      toContract,
+          calldata: calldata,
+          value:   sats,
+          feeRate: 5,          // sat/vbyte — bisa disesuaikan
+          network: 'testnet',
+        }
+      });
+
+      const txid = result?.txid || result?.tx_hash || result?.hash || JSON.stringify(result).slice(0,30);
+      return { txid, type: 'contract' };
+    } catch(e) {
+      // Jika signInteraction gagal → fallback ke sendBitcoin
+      console.warn('signInteraction gagal, fallback sendBitcoin:', e.message);
     }
-    toAddr = MOTOCHEF_BTC_POOL;
   }
 
-  // ──────────────────────────────────────────
-  // sendBitcoin — OP_WALLET / UniSat API
-  // Membuka popup konfirmasi di wallet user
-  // Returns txid string setelah dikonfirmasi
-  // ──────────────────────────────────────────
-  if (typeof S.w.p.sendBitcoin !== 'function') {
-    throw new Error('Wallet tidak mendukung sendBitcoin. Pastikan OP_WALLET versi terbaru.');
+  // Fallback: sendBitcoin langsung ke contract address
+  // (bekerja di semua versi OP_WALLET & UniSat)
+  if (typeof prov.sendBitcoin !== 'function') {
+    throw new Error('Wallet tidak mendukung sendBitcoin.\nPastikan OP_WALLET versi terbaru terpasang.');
   }
 
-  const txid = await S.w.p.sendBitcoin(toAddr, sats);
-  return txid;
+  const ADDR_MAP = {
+    'btc-stake':    'tb1p24gquaqyrgszwwu5xt7vewczzdftm7lzpzgmj56vqxm9d0hgnk3spzm7x5',
+    'moto-lp':      'tb1p2rdsm82ry9zmf8uxd8cdrw7s42zrxl7ty97m09rxuuhyq5k66wusj7u9rl',
+    'moto-pill-lp': 'tb1p2rdsm82ry9zmf8uxd8cdrw7s42zrxl7ty97m09rxuuhyq5k66wusj7u9rl',
+  };
+  const toAddr = ADDR_MAP[pool.id] || ADDR_MAP['btc-stake'];
+
+  const txid = await prov.sendBitcoin(toAddr, sats);
+  return { txid, type: 'bitcoin' };
 }
 
 // ════════════════════════════════════════════════
@@ -548,16 +623,20 @@ async function doDeposit() {
   renderModal();
 
   try {
-    const txid = await executeDeposit(pool, amt);
+    const result = await executeDeposit(pool, amt);
+    const txid = result?.txid ?? result;
+    const txType = result?.type ?? 'bitcoin';
     S.modal.txid = txid;
+    S.modal.txType = txType;
     S.modal.step = 'success';
-    S.positions.unshift({ pool, amount, txid, ts: Date.now() });
+    S.positions.unshift({ pool, amount, txid, txType, ts: Date.now() });
     setTimeout(refreshBal, 4000);
-    toast(`✓ ${amount} ${pool.token.split('/')[0]} → ${pool.name} berhasil!`);
+    const lbl = txType === 'contract' ? '⚡ Contract berhasil' : txType === 'signature' ? '✍️ Intent tersimpan' : '✓ Transaksi berhasil';
+    toast(`${lbl}: ${amount} ${pool.token.split('/')[0]} → ${pool.name}!`);
   } catch(err) {
     S.modal.err = err?.message || 'Transaksi gagal';
     S.modal.step = 'error';
-    toast(S.modal.err, 'err');
+    toast(S.modal.err.split('\n')[0], 'err');
   }
 
   renderModal();
@@ -620,7 +699,9 @@ function renderModal() {
 
   else if (step === 'confirm') {
     const sats = Math.floor(parseFloat(amount) * 1e8);
-    const isSign = pool.txType === 'signMessage';
+    const isSign = pool.id === 'moto-stake';
+    const method = isSign ? 'signMessage' : (typeof window.opnet?.signInteraction === 'function' ? 'signInteraction' : 'sendBitcoin');
+    const methodColor = method === 'signInteraction' ? 'var(--btc)' : method === 'sendBitcoin' ? '#a78bfa' : 'var(--gr)';
     h = `
     ${stepsH}
     <div class="mt2">Konfirmasi Transaksi</div>
@@ -632,9 +713,10 @@ function renderModal() {
       ${!isSign ? `<div class="crow"><span>Satoshi</span><span style="font-family:var(--mono);font-size:10px">${sats.toLocaleString()} sats</span></div>` : ''}
       <div class="crow"><span>APY</span><span style="color:var(--gr)">${pool.apy.toFixed(1)}%</span></div>
       <div class="crow"><span>Network</span><span style="color:var(--ye)">OpNet Testnet 3</span></div>
+      <div class="crow"><span>Metode TX</span><span style="color:${methodColor};font-family:var(--mono);font-size:10px">${method}</span></div>
       <div class="crow"><span>Wallet</span><span style="font-family:var(--mono);font-size:10px">${sa(S.w?.address||'')}</span></div>
     </div>
-    <div class="info-box">✓ Popup <strong>${S.w?.name||'wallet'}</strong> akan muncul. Klik <strong>Confirm</strong> / <strong>Sign</strong> untuk melanjutkan transaksi.</div>
+    <div class="info-box">✓ Popup <strong>${S.w?.name||'OP_WALLET'}</strong> akan muncul → klik <strong>Confirm</strong> / <strong>Sign</strong> untuk lanjut.</div>
     <div class="macts">
       <button class="bcan" onclick="S.modal.step='input';renderModal()">← Kembali</button>
       <button class="bok" onclick="doDeposit()">⚡ Sign & Kirim</button>
@@ -654,33 +736,41 @@ function renderModal() {
 
   else if (step === 'success') {
     const isSig = txid?.startsWith('sig_');
+    const txtp = S.modal.txType || 'bitcoin';
+    const label = txtp === 'contract' ? '⚡ Smart Contract Berhasil!' : isSig ? '✍️ Intent Tercatat!' : '✅ Transaksi Berhasil!';
+    const typeLabel = txtp === 'contract' ? 'signInteraction (L2 Contract Call)' : isSig ? 'signMessage (Intent Proof)' : 'sendBitcoin (L1 Transfer)';
     h = `
     ${stepsH}
     <div class="mctr">
       <div class="sok">✓</div>
-      <div style="font-size:17px;font-weight:800">${isSig ? 'Intent Tercatat!' : 'Transaksi Berhasil! 🎉'}</div>
+      <div style="font-size:17px;font-weight:800">${label}</div>
       <div style="font-size:13px;color:var(--mu)">${amount} ${pool.token.split('/')[0]} → ${pool.name}</div>
+      <div style="font-size:10px;color:var(--btc);font-family:var(--mono);background:var(--dim);border:1px solid var(--bdr);border-radius:5px;padding:3px 9px">${typeLabel}</div>
       ${txid && !isSig ? `
-      <div style="font-size:10px;color:var(--mu);font-family:var(--mono);word-break:break-all;max-width:320px;text-align:center">TxID: ${txid.slice(0,30)}…</div>
-      <a class="txlnk" href="${EXPLORER}/tx/${txid}" target="_blank" rel="noopener noreferrer">Lihat di OPScan ↗</a>` : ''}
-      ${isSig ? `<div style="font-size:11px;color:var(--mu);max-width:280px;text-align:center;line-height:1.5">Intent signed! Untuk stake MOTO, kamu perlu MOTO token. Swap BTC → MOTO dulu di <a href="${MOTOSWAP}" target="_blank" style="color:var(--btc)">motoswap.org</a></div>` : ''}
-      <button class="bok" onclick="closeModal()" style="margin-top:8px;flex:none;padding:10px 26px">Selesai</button>
+      <div style="font-size:10px;color:var(--mu);font-family:var(--mono);word-break:break-all;max-width:320px;text-align:center;line-height:1.6">TxID:<br/>${txid.slice(0,36)}…</div>
+      <a class="txlnk" href="${EXPLORER}/tx/${txid}" target="_blank" rel="noopener noreferrer">🔍 Lihat di OPScan ↗</a>` : ''}
+      ${isSig ? `<div style="font-size:11px;color:var(--mu);max-width:290px;text-align:center;line-height:1.6">Intent tersimpan. Untuk stake MOTO, kamu perlu token MOTO terlebih dahulu. Swap tBTC → MOTO di <a href="${MOTOSWAP}" target="_blank" style="color:var(--btc)">motoswap.org</a></div>` : ''}
+      <button class="bok" onclick="closeModal()" style="margin-top:8px;flex:none;padding:10px 28px">✓ Selesai</button>
     </div>`;
   }
 
   else if (step === 'error') {
+    const lines = (err||'').split('\n');
     h = `
     ${stepsH}
     <div class="mctr">
       <div class="serr">✕</div>
       <div style="font-size:16px;font-weight:800;color:#f87171">Transaksi Gagal</div>
-      <div style="font-size:12px;color:var(--mu);max-width:300px;text-align:center;line-height:1.55">${esc(err)}</div>
-      <div style="font-size:11px;color:var(--mu);text-align:center;line-height:1.5;margin-top:4px">
-        Cek:<br/>• Wallet di <strong>Testnet 3</strong><br/>• Saldo cukup<br/>
-        <a href="${FAUCET}" target="_blank" style="color:var(--btc)">Claim tBTC gratis →</a>
+      <div style="font-size:12px;color:var(--mu);max-width:300px;text-align:center;line-height:1.65;white-space:pre-line">${esc(err)}</div>
+      <div style="background:rgba(255,255,255,.03);border:1px solid var(--s2);border-radius:9px;padding:11px 14px;font-size:11px;color:var(--mu);text-align:left;max-width:300px;line-height:1.7">
+        <strong style="color:var(--tx)">Cara memperbaiki:</strong><br/>
+        • Pastikan network = <strong style="color:var(--ye)">Testnet 3</strong><br/>
+        • Saldo cukup → <a href="${FAUCET}" target="_blank" style="color:var(--btc)">claim tBTC gratis</a><br/>
+        • Cek OP_WALLET versi terbaru<br/>
+        • Klik <em>Confirm</em> di popup wallet
       </div>
       <div class="macts" style="margin-top:14px">
-        <button class="bcan" onclick="S.modal.step='input';renderModal()">Coba Lagi</button>
+        <button class="bcan" onclick="S.modal.step='input';renderModal()">← Coba Lagi</button>
         <button class="bcan" onclick="closeModal()">Tutup</button>
       </div>
     </div>`;
